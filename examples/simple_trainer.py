@@ -71,6 +71,12 @@ class Config:
     # Load EXIF exposure metadata from images (if available)
     load_exposure: bool = True
 
+    # Optional: only use specific per-camera image indices for pano_camera rigs.
+    # Interpreted as 1-based indices within each pano_cameraXX/ directory after
+    # sorting filenames, e.g. [1, 4, 16] means: for every pano_cameraXX, only
+    # keep its 1st, 4th, and 16th image (if they exist).
+    pano_image_indices: Optional[List[int]] = None
+
     # Port for the viewer server
     port: int = 8080
 
@@ -93,8 +99,14 @@ class Config:
     disable_video: bool = False
 
     # Initialization strategy
+    # - "sfm": use COLMAP sparse points (default behavior in the original repo)
+    # - "random": random points in a bounding box
+    # - "sparse_points": alias of "sfm" (for lcx configs)
+    # - "ply_points": initialize from a dense PLY point cloud (requires init_ply_path)
     init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
+    # Optional path to a PLY file when using init_type="ply_points"
+    init_ply_path: Optional[str] = None
+    # Initial number of GSs. Ignored if using sfm or ply_points
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
@@ -188,6 +200,24 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Whether to use external dense depth maps instead of COLMAP sparse points
+    # If True, Dataset will try to load per-image depth maps from `external_depth_dir`,
+    # and training will supervise the rendered depth map densely.
+    use_external_depth: bool = False
+    # Root directory for external depth maps (when using image-based depth).
+    # Files are expected to mirror the COLMAP image relative paths
+    # (e.g. images/pano_camera0/xxx.jpg -> depth_root/pano_camera0/xxx.npy).
+    # Supported extensions: .npy, .npz.
+    external_depth_dir: Optional[str] = None
+    # Type of external depth source when use_external_depth is True:
+    # - "img": per-image depth maps in external_depth_dir (original behavior)
+    # - "ply": a single fused point cloud in external_depth_path to be
+    #          reprojected to each camera to obtain a depth map
+    external_depth_type: Literal["img", "ply"] = "img"
+    # Path to a fused point cloud (PLY) used for external depth supervision
+    # when external_depth_type == "ply".
+    external_depth_path: Optional[str] = None
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -227,6 +257,7 @@ class Config:
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
+    init_ply_path: Optional[str] = None,
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
@@ -247,9 +278,46 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
+    # 1. Initialize 3D points and RGBs according to init_type
+    if init_type in ("sfm", "sparse_points"):
+        # Original behavior: use COLMAP sparse points
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+    elif init_type in ("ply_points", "ply"):
+        # Initialize from a dense PLY point cloud.
+        # This is useful when you have fused depth into a dense point cloud.
+        if init_ply_path is None:
+            raise ValueError(
+                "init_ply_path must be provided when init_type is 'ply_points' or 'ply'."
+            )
+        from pathlib import Path
+
+        ply_path = Path(init_ply_path).expanduser()
+        if not ply_path.is_file():
+            raise FileNotFoundError(f"PLY file for initialization not found: {ply_path}")
+
+        try:
+            import open3d as o3d  # type: ignore
+        except ImportError as e:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "PLY initialization requires the 'open3d' package. "
+                "Please install it via 'pip install open3d'."
+            ) from e
+
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        if len(pcd.points) == 0:
+            raise ValueError(f"No points found in PLY file: {ply_path}")
+
+        points_np = np.asarray(pcd.points, dtype=np.float32)
+        if pcd.has_colors():
+            colors_np = np.asarray(pcd.colors, dtype=np.float32)
+            colors_np = np.clip(colors_np, 0.0, 1.0)
+        else:
+            # If no colors, use a neutral gray.
+            colors_np = np.full_like(points_np, 0.5, dtype=np.float32)
+
+        points = torch.from_numpy(points_np)
+        rgbs = torch.from_numpy(colors_np).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -354,14 +422,23 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             load_exposure=cfg.load_exposure,
+            pano_image_indices=cfg.pano_image_indices,
         )
         self.trainset = Dataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            use_external_depth=cfg.use_external_depth,
+            external_depth_dir=cfg.external_depth_dir,
+            external_depth_type=cfg.external_depth_type,
+            external_depth_path=cfg.external_depth_path,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = Dataset(
+            self.parser,
+            split="val",
+            load_depths=False,  # no depth supervision in val
+        )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -389,6 +466,7 @@ class Runner:
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
+             init_ply_path=cfg.init_ply_path,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
@@ -758,7 +836,9 @@ class Runner:
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
-            if cfg.depth_loss:
+            # Sparse COLMAP depth supervision only needs points/depths
+            # when we are NOT using external dense depth.
+            if cfg.depth_loss and not cfg.use_external_depth:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
@@ -813,24 +893,50 @@ class Runner:
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                if cfg.use_external_depth:
+                    # Dense depth supervision using external depth map.
+                    # depths: [1, H, W, 1], external depth_map: [H, W]
+                    assert depths is not None, "Rendered depth map is required for depth_loss."
+                    depth_pred = depths[0, ..., 0]  # [H, W]
+                    depth_gt = data["depth_map"].to(device)  # [H, W]
+                    # valid pixels: positive GT depth (and valid prediction)
+                    valid = (depth_gt > 0.0) & (depth_pred > 0.0)
+                    num_valid = valid.sum()
+                    if num_valid > 0:
+                        disp = torch.where(
+                            depth_pred > 0.0,
+                            1.0 / depth_pred,
+                            torch.zeros_like(depth_pred),
+                        )
+                        disp_gt = torch.where(
+                            depth_gt > 0.0,
+                            1.0 / depth_gt,
+                            torch.zeros_like(depth_gt),
+                        )
+                        diff = (disp - disp_gt).abs() * valid.float()
+                        depthloss = diff.sum() / num_valid * self.scene_scale
+                        loss += depthloss * cfg.depth_lambda
+                else:
+                    # query depths from depth map at sparse COLMAP 3D points
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(
+                        depths > 0.0, 1.0 / depths, torch.zeros_like(depths)
+                    )
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids

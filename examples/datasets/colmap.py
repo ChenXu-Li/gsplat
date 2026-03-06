@@ -65,12 +65,14 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        pano_image_indices: Optional[List[int]] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
         self.load_exposure = load_exposure
+        self.pano_image_indices = pano_image_indices
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -162,6 +164,52 @@ class Parser:
         image_names = [image_names[i] for i in inds]
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
+
+        # Optional: restrict to specific per-camera image indices for pano_camera rigs.
+        # pano_image_indices is interpreted as a 1-based index list within each
+        # pano_cameraXX/ directory after sorting filenames.
+        if self.pano_image_indices is not None:
+            # Validate indices are positive.
+            valid_p = [p for p in self.pano_image_indices if p >= 1]
+            if len(valid_p) != len(self.pano_image_indices):
+                raise ValueError(
+                    f"pano_image_indices must be 1-based positive integers, got {self.pano_image_indices}"
+                )
+
+            import re
+
+            cam_pattern = re.compile(r"(pano_camera\d+)/")
+            # Group global indices by pano_camera directory.
+            per_cam: Dict[str, List[int]] = {}
+            for g_idx, name in enumerate(image_names):
+                m = cam_pattern.match(name)
+                if not m:
+                    # Not a pano_camera-style image; currently drop it when filtering.
+                    continue
+                cam_dir = m.group(1)
+                per_cam.setdefault(cam_dir, []).append(g_idx)
+
+            keep_global_indices: List[int] = []
+            for cam_dir, g_indices in per_cam.items():
+                # Sort by filename within this camera.
+                g_indices_sorted = sorted(g_indices, key=lambda i: image_names[i])
+                num_imgs = len(g_indices_sorted)
+                # Convert 1-based indices to 0-based within this camera.
+                for p in valid_p:
+                    if p <= num_imgs:
+                        keep_global_indices.append(g_indices_sorted[p - 1])
+
+            if not keep_global_indices:
+                raise ValueError(
+                    f"pano_image_indices={self.pano_image_indices} resulted in zero selected images."
+                )
+
+            keep_global_indices = sorted(set(keep_global_indices))
+
+            # Apply selection to per-image arrays.
+            image_names = [image_names[i] for i in keep_global_indices]
+            camtoworlds = camtoworlds[keep_global_indices]
+            camera_ids = [camera_ids[i] for i in keep_global_indices]
 
         # Load extended metadata. Used by Bilarf dataset.
         self.extconf = {
@@ -394,16 +442,69 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        use_external_depth: bool = False,
+        external_depth_dir: Optional[str] = None,
+        external_depth_type: str = "img",
+        external_depth_path: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.use_external_depth = use_external_depth
+        self.external_depth_dir = external_depth_dir
+        self.external_depth_type = external_depth_type
+        self.external_depth_path = external_depth_path
+
+        if self.load_depths and self.use_external_depth:
+            if self.external_depth_type == "img" and self.external_depth_dir is None:
+                raise ValueError(
+                    "external_depth_dir must be provided when use_external_depth is True "
+                    "and external_depth_type is 'img'."
+                )
+            if self.external_depth_type == "ply" and self.external_depth_path is None:
+                raise ValueError(
+                    "external_depth_path must be provided when use_external_depth is True "
+                    "and external_depth_type is 'ply'."
+                )
+        # Global indices after any Parser-level filtering (e.g. pano_image_indices).
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+
+        # Debug info: how many images actually used for this split.
+        # This number already reflects pano_image_indices filtering in Parser
+        # and the train/val split by test_every.
+        print(
+            f"[Dataset] split='{self.split}': "
+            f"{len(self.indices)} images used out of {len(self.parser.image_names)} "
+            f"Parser images (test_every={self.parser.test_every})."
+        )
+
+        # Pre-load fused point cloud when using PLY-based external depth.
+        self._ply_points_world: Optional[np.ndarray] = None
+        if self.load_depths and self.use_external_depth and self.external_depth_type == "ply":
+            from pathlib import Path
+
+            ply_path = Path(self.external_depth_path).expanduser()
+            if not ply_path.is_file():
+                raise FileNotFoundError(
+                    f"External depth PLY file not found: {ply_path}"
+                )
+            try:
+                import open3d as o3d  # type: ignore
+            except ImportError as e:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "PLY-based external depth requires the 'open3d' package. "
+                    "Please install it via 'pip install open3d'."
+                ) from e
+
+            pcd = o3d.io.read_point_cloud(str(ply_path))
+            if len(pcd.points) == 0:
+                raise ValueError(f"No points found in external depth PLY: {ply_path}")
+            self._ply_points_world = np.asarray(pcd.points, dtype=np.float32)
 
     def __len__(self):
         return len(self.indices)
@@ -454,27 +555,114 @@ class Dataset:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
-            image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+            if self.use_external_depth:
+                if self.external_depth_type == "img":
+                    # Load external dense depth map aligned with the (possibly cropped) image.
+                    # Depth files are expected to mirror COLMAP image relative paths:
+                    #   images/pano_camera0/xxx.jpg -> external_depth_dir/pano_camera0/xxx.npy
+                    image_name = self.parser.image_names[index]
+                    rel_path = image_name
+                    stem, _ = os.path.splitext(rel_path)
+                    # Try .npy then .npz
+                    depth_path_npy = os.path.join(self.external_depth_dir, stem + ".npy")
+                    depth_path_npz = os.path.join(self.external_depth_dir, stem + ".npz")
+                    depth = None
+                    if os.path.isfile(depth_path_npy):
+                        depth = np.load(depth_path_npy)
+                    elif os.path.isfile(depth_path_npz):
+                        npz = np.load(depth_path_npz)
+                        # heuristics: use "depth" key if present, else first array
+                        if isinstance(npz, np.lib.npyio.NpzFile):
+                            if "depth" in npz.files:
+                                depth = npz["depth"]
+                            else:
+                                depth = npz[npz.files[0]]
+                        else:
+                            depth = npz
+                    else:
+                        raise FileNotFoundError(
+                            f"External depth map not found for image '{image_name}'. "
+                            f"Tried: {depth_path_npy}, {depth_path_npz}"
+                        )
+
+                    # Ensure depth is HxW and matches current image size; resize if needed.
+                    if depth.ndim == 3:
+                        depth = depth[..., 0]
+                    if depth.shape[:2] != image.shape[:2]:
+                        depth = cv2.resize(
+                            depth.astype(np.float32),
+                            (image.shape[1], image.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    data["depth_map"] = torch.from_numpy(depth.astype(np.float32))
+                elif self.external_depth_type == "ply":
+                    # Reproject fused PLY point cloud to obtain a dense-ish depth map.
+                    assert (
+                        self._ply_points_world is not None
+                    ), "PLY points not loaded for external depth."
+                    worldtocams = np.linalg.inv(camtoworlds)  # [4, 4]
+                    R = worldtocams[:3, :3]
+                    t = worldtocams[:3, 3:4]
+                    pts_world = self._ply_points_world  # [N, 3]
+                    pts_cam = (R @ pts_world.T + t).T  # [N, 3]
+                    z = pts_cam[:, 2]
+                    # keep only points in front of the camera
+                    front = z > 0
+                    pts_cam = pts_cam[front]
+                    z = z[front]
+                    if pts_cam.shape[0] > 0:
+                        pts_proj = (K @ pts_cam.T).T  # [N, 3]
+                        x = pts_proj[:, 0] / pts_proj[:, 2]
+                        y = pts_proj[:, 1] / pts_proj[:, 2]
+                        H, W = image.shape[:2]
+                        x_int = x.astype(np.int32)
+                        y_int = y.astype(np.int32)
+                        inside = (
+                            (x_int >= 0)
+                            & (x_int < W)
+                            & (y_int >= 0)
+                            & (y_int < H)
+                        )
+                        x_int = x_int[inside]
+                        y_int = y_int[inside]
+                        z_inside = z[inside]
+                        depth_map = np.zeros((H, W), dtype=np.float32)
+                        # For each pixel, keep the nearest depth.
+                        for xi, yi, zi in zip(x_int, y_int, z_inside):
+                            current = depth_map[yi, xi]
+                            if current == 0.0 or zi < current:
+                                depth_map[yi, xi] = zi
+                        data["depth_map"] = torch.from_numpy(depth_map)
+                    else:
+                        # No points in front of camera; provide an all-zero depth map.
+                        depth_map = np.zeros(image.shape[:2], dtype=np.float32)
+                        data["depth_map"] = torch.from_numpy(depth_map)
+                else:
+                    raise ValueError(
+                        f"Unknown external_depth_type: {self.external_depth_type}"
+                    )
+            else:
+                # projected points to image plane to get depths from COLMAP sparse points
+                worldtocams = np.linalg.inv(camtoworlds)
+                image_name = self.parser.image_names[index]
+                point_indices = self.parser.point_indices[image_name]
+                points_world = self.parser.points[point_indices]
+                points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+                points_proj = (K @ points_cam.T).T
+                points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+                depths = points_cam[:, 2]  # (M,)
+                # filter out points outside the image
+                selector = (
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < image.shape[1])
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < image.shape[0])
+                    & (depths > 0)
+                )
+                points = points[selector]
+                depths = depths[selector]
+                data["points"] = torch.from_numpy(points).float()
+                data["depths"] = torch.from_numpy(depths).float()
 
         return data
 
@@ -491,7 +679,12 @@ if __name__ == "__main__":
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir,
+        factor=args.factor,
+        normalize=True,
+        test_every=8,
+        load_exposure=False,
+        pano_image_indices=None,
     )
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")
