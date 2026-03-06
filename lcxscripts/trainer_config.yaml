@@ -1,0 +1,64 @@
+## Basic LCX trainer config for gsplat/examples/simple_trainer.py
+## You can edit paths and hyper-parameters as needed.
+
+# Choose GS model type: \"3dgs\" (default) uses examples/simple_trainer.py,
+# \"2dgs\" uses examples/simple_trainer_2dgs.py
+model_type: "3dgs"
+
+# Path to training data (see examples/datasets/colmap.py for expected format)
+data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
+pano_image_indices: [1,2,3,4,5,6,7,8,16]
+# Downsample factor for the dataset
+data_factor: 1
+
+# Directory to save results (checkpoints, stats, renders, etc.)
+result_dir: /root/autodl-tmp/results/gsplat/bar16_[model_type]_denseinit_plydepth
+
+#sparse_points:直接从colmap的points3D.bin初始化
+#ply_points:从ply文件初始化
+
+init_type: ply_points #直接从colmap的points3D.bin初始化
+init_ply_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/fused.ply
+
+# 是否使用深度监督，默认使用sparse_points监督，如果external_depth_type为true，则使用external_depth_type监督
+depth_loss: true
+
+# 深度损失权重（默认在代码里是 1e-2，可以按需要调整）
+depth_lambda: 0.
+
+# 是否使用外部“自己的”深度图来做 dense 监督
+use_external_depth: true
+
+# external_depth_type:
+# "img":使用img文件的深度图
+# "ply":使用ply文件的深度图
+external_depth_type: "ply"
+external_depth_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/fused.ply
+# external_depth_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/depth_npys/
+
+
+# Every N images there is a test image
+test_every: 8
+
+# Training batch size
+batch_size: 1
+
+# Number of training steps
+max_steps: 6001
+
+# Steps to save the model checkpoints
+save_steps: [500, 6000]
+
+# Steps to evaluate the model (renders validation images)
+# 注意：评估会在 step = eval_steps[i] - 1 时运行
+eval_steps: [500, 6000]
+
+# Global scaling of all schedule-related steps (1.0 = default schedule)
+steps_scaler: 1.0
+
+# Whether to normalize world space
+normalize_world_space: true
+
+# Camera model: pinhole / ortho / fisheye
+camera_model: pinhole
+

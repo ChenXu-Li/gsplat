@@ -1,0 +1,24 @@
+## LCX viewer/eval config for gsplat/examples/simple_trainer.py
+## 专门给 lcxscripts/viewer.py 使用，不参与训练。
+
+# Path to evaluation data (should match training data)
+data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
+
+# Downsample factor for the dataset
+data_factor: 4
+
+# Directory to save viewer/eval results (renders, videos, stats, etc.)
+result_dir: /root/autodl-tmp/results/gsplat/bar16_viewer
+
+# Whether to normalize world space (should match training setting)
+normalize_world_space: true
+
+# Camera model: pinhole / ortho / fisheye (should match training setting)
+camera_model: pinhole
+
+# 默认关闭交互式 viewer，仅做离线评估 + 轨迹渲染
+disable_viewer: true
+
+# 默认使用的 checkpoint（可以改成任意已有的 ckpt_*.pt 路径）
+viewer_ckpt: /root/autodl-tmp/results/gsplat/bar16_default/ckpts/ckpt_5999_rank0.pt
+

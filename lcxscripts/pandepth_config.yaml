@@ -1,0 +1,53 @@
+## LCX gs_pandepth-style cubemap & panorama exporter for gsplat checkpoints
+## 参考 depth-anything-3 中 infer_gs_rigcolmap.py 的 gs_pandepth 用法。
+## 本文件只用于离线导出，不参与训练。
+
+# 与训练/评估一致的数据目录（COLMAP 结构）
+data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
+
+# 下采样因子，要与训练时保持一致（用于 Parser）
+data_factor: 1
+
+# 是否归一化世界坐标（要与训练 cfg.normalize_world_space 一致）
+normalize_world_space: true
+
+# 输出根目录：每个视角会在下面创建子文件夹
+result_dir: /root/autodl-tmp/results/gsplat/bar16_denseinit_plydepth/pandepth
+
+# 要加载的 ckpt（单个 rank 的 ckpt 即可）
+ckpt: /root/autodl-tmp/results/gsplat/bar16_denseinit_plydepth/ckpts/ckpt_5999_rank0.pt
+
+# 新方式：使用前向参考相机的外参作为全景图正前方
+# pano_cameras: 要导出的全景图编号列表（例如 [0, 1, 15] 表示导出 3 张全景图）
+# pano_front_camera_index: 前向参考相机编号（例如 12 表示使用 pano_camera12）
+# 逻辑：对于 pano_cameras 中的每个编号 i，使用 pano_front_camera_index 的第 i 张图片的外参
+#       作为该全景图的正前方（cubemap 中心位置）
+# 示例：pano_cameras=[0,1,15], pano_front_camera_index=12
+#       -> pano_camera00 使用 pano_camera12 的第 0 张图片外参
+#       -> pano_camera01 使用 pano_camera12 的第 1 张图片外参
+#       -> pano_camera15 使用 pano_camera12 的第 15 张图片外参
+pano_cameras: [0, 1, 15]
+pano_front_camera_index: 12
+
+
+# cubemap 每一面的分辨率（正方形）
+cube_face_size: 1024
+
+# 全景图分辨率 [H, W]，如果不填则使用 [cube_face_size, 2 * cube_face_size]
+pano_size: [1024, 2048]
+
+# 近远平面（和训练 cfg.near_plane / far_plane 对齐）
+near_plane: 0.01
+far_plane: 1.0e10
+
+# 球谐函数度数（和训练 cfg.sh_degree 对齐，默认 3）
+sh_degree: 3
+
+# 深度图可视化模式
+# "grayscale": 使用灰度图（gsplat 风格，与 render_traj 一致）
+# "colored": 使用彩色图（depth-anything-3 风格，使用 colormap）
+depth_mode: colored
+
+# 深度图彩色映射配置（仅在 depth_mode="colored" 时生效）
+depth_cmap: Spectral  # Matplotlib colormap 名称（如 "Spectral", "turbo", "viridis", "jet" 等）
+depth_percentile: 2.0  # 用于计算 min/max 的百分位数（默认 2.0，即使用 2% 和 98% 分位数）
