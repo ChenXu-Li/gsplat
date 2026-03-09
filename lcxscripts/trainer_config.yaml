@@ -6,25 +6,25 @@
 model_type: "3dgs"
 
 # Path to training data (see examples/datasets/colmap.py for expected format)
-data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
-pano_image_indices: [1,2,3,4,5,6,7,8,16]
+data_dir: /root/autodl-tmp/data/colmap_STAGE1_4x/BridgeB
+pano_image_indices: [2,3,4]
 # Downsample factor for the dataset
 data_factor: 1
 
-# Directory to save results (checkpoints, stats, renders, etc.)
-result_dir: /root/autodl-tmp/results/gsplat/bar16_[model_type]_denseinit_plydepth
+# Directory to save results (checkpoints, stats, renders, etc.)DPA
+result_dir: /root/autodl-tmp/results/gsplat/BridgeB_[model_type]_DPAinit_just3
 
 #sparse_points:直接从colmap的points3D.bin初始化
 #ply_points:从ply文件初始化
 
-init_type: ply_points #直接从colmap的points3D.bin初始化
-init_ply_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/fused.ply
+init_type: ply_points 
+init_ply_path: /root/autodl-tmp/data/colmap_STAGE1_4x/BridgeB/DPA_Fused_Shell.ply
 
 # 是否使用深度监督，默认使用sparse_points监督，如果external_depth_type为true，则使用external_depth_type监督
-depth_loss: true
+depth_loss: false
 
 # 深度损失权重（默认在代码里是 1e-2，可以按需要调整）
-depth_lambda: 0.
+depth_lambda: 0.1
 
 # 是否使用外部“自己的”深度图来做 dense 监督
 use_external_depth: true
@@ -33,32 +33,72 @@ use_external_depth: true
 # "img":使用img文件的深度图
 # "ply":使用ply文件的深度图
 external_depth_type: "ply"
-external_depth_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/fused.ply
+external_depth_path: /root/autodl-tmp/results/DPAplys/BridgeB/DPA_pointcloud_scale.ply
+use_ply_depth_cache: true
+# PLY 深度缓存目录（磁盘），为 None 时默认使用 data_dir/ply_depth_cache
+ply_depth_cache_dir: null
+# 是否在本次训练开始前重新计算并覆盖所有缓存深度图
+ply_depth_recompute: false
 # external_depth_path: /root/autodl-tmp/data/colmap_360Roam_4x/bar16/depth_npys/
 
 
 # Every N images there is a test image
-test_every: 8
+test_every: 40
 
 # Training batch size
 batch_size: 1
 
 # Number of training steps
-max_steps: 6001
+max_steps: 30000
 
-# Steps to save the model checkpoints
-save_steps: [500, 6000]
+# Steps to save the model checkpoints#max
+save_steps: [500,7000]
 
 # Steps to evaluate the model (renders validation images)
 # 注意：评估会在 step = eval_steps[i] - 1 时运行
-eval_steps: [500, 6000]
+eval_steps: [500,7000]
 
 # Global scaling of all schedule-related steps (1.0 = default schedule)
 steps_scaler: 1.0
 
 # Whether to normalize world space
-normalize_world_space: true
+normalize_world_space: false #千万别归一化，不然dpa生成的点云就对不齐了
 
 # Camera model: pinhole / ortho / fisheye
 camera_model: pinhole
 
+# ==================== 渲染参数（3DGS 和 2DGS 通用）====================
+
+# 近平面和远平面（用于渲染时的深度裁剪）
+# 3DGS 默认值: near_plane=0.01, far_plane=1e10 (基本不限制)
+# 2DGS 默认值: near_plane=0.2, far_plane=200
+# 建议：根据场景尺度调整
+#   - 室内场景：near_plane=0.01~0.1, far_plane=10~50
+#   - 室外场景：near_plane=0.1~0.5, far_plane=50~200
+#   - 大尺度场景：near_plane=0.5~1.0, far_plane=200~1000
+# 如果不设置，3DGS 会使用默认值（near_plane=0.01, far_plane=1e10）
+near_plane: 0.01    # 3DGS 默认值，可根据场景调整
+far_plane: 1e10     # 3DGS 默认值（非常大，基本不限制），可根据场景调整
+
+# ==================== 2DGS 特有参数 ====================
+
+# 法线一致性损失（2DGS 核心特性，改善表面几何）
+normal_loss: true          # 启用法线一致性损失
+normal_lambda: 0.05        # 法线损失权重（默认 5e-2）
+normal_start_iter: 7000    # 第 7000 步开始法线正则化
+
+# 畸变损失（2DGS 核心特性，改善平面几何）
+dist_loss: true            # 启用畸变损失
+dist_lambda: 0.01          # 畸变损失权重（默认 1e-2）
+dist_start_iter: 3000       # 第 3000 步开始畸变损失
+
+# 2DGS 模型类型选择（"2dgs" 或 "2dgs-inria"）
+# "2dgs": 使用 gsplat 原生实现
+# "2dgs-inria": 使用 INRIA 官方实现
+model_type_2dgs_variant: "2dgs"
+
+# ==================== 注意 ====================
+# 2DGS 的 depth_loss 实现与 3DGS 不同：
+# - 仅支持从 COLMAP sparse points 加载深度
+# - 不支持 use_external_depth / external_depth_type / external_depth_path 等参数
+# - 上述外部深度相关参数在 2DGS 中会被忽略

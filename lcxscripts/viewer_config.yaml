@@ -2,23 +2,46 @@
 ## 专门给 lcxscripts/viewer.py 使用，不参与训练。
 
 # Path to evaluation data (should match training data)
-data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
+data_dir: /root/autodl-tmp/data/colmap_STAGE1_4x/BridgeB
 
 # Downsample factor for the dataset
-data_factor: 4
+data_factor: 1
 
 # Directory to save viewer/eval results (renders, videos, stats, etc.)
-result_dir: /root/autodl-tmp/results/gsplat/bar16_viewer
+result_dir: /root/autodl-tmp/results/gsplat/BridgeB_3dgs_DPAinit_depthloss_viewer
 
 # Whether to normalize world space (should match training setting)
-normalize_world_space: true
+normalize_world_space: false
 
 # Camera model: pinhole / ortho / fisheye (should match training setting)
 camera_model: pinhole
 
-# 默认关闭交互式 viewer，仅做离线评估 + 轨迹渲染
-disable_viewer: true
+# 是否禁用交互式 viewer
+# true:  仅做离线评估 + 轨迹渲染（默认，适合批量渲染）
+# false: 启用浏览器交互查看器（需要运行时使用 --enable_viewer 参数）
+disable_viewer: false
 
 # 默认使用的 checkpoint（可以改成任意已有的 ckpt_*.pt 路径）
-viewer_ckpt: /root/autodl-tmp/results/gsplat/bar16_default/ckpts/ckpt_5999_rank0.pt
+viewer_ckpt: /root/autodl-tmp/results/gsplat/BridgeB_3dgs_DPAinit_depthloss/ckpts/ckpt_29999_rank0.pt
 
+# 是否渲染轨迹视频
+# true:  渲染轨迹视频（默认）
+# false: 跳过轨迹渲染，节省时间和磁盘空间
+render_trajectory: false
+
+# 轨迹渲染模式（仅在 render_trajectory: true 时生效）
+# "interp": 插值轨迹（平滑过渡，默认）
+# "spiral": 螺旋轨迹
+# "original": 原始相机轨迹
+# "none": 不渲染轨迹（等同于 render_trajectory: false）
+render_traj_path: interp
+
+# 是否计算评估指标（PSNR, SSIM, LPIPS）
+# true:  计算指标（默认，需要 ground truth 图像）
+# false: 跳过指标计算，仅渲染图像
+compute_metrics: false
+
+# 是否禁用视频生成（仅在 render_trajectory: true 时生效）
+# true:  只保存图片帧，不生成视频
+# false: 生成 MP4 视频（默认）
+disable_video: true

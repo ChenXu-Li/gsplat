@@ -51,6 +51,9 @@ class Config:
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
+    # Whether to run evaluation (compute metrics) in eval-only mode
+    # Set to False to skip metrics computation and only render images/videos
+    run_eval: bool = True
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -217,6 +220,16 @@ class Config:
     # Path to a fused point cloud (PLY) used for external depth supervision
     # when external_depth_type == "ply".
     external_depth_path: Optional[str] = None
+    # Whether to use PLY depth cache (on-disk). If True and external_depth_type == "ply",
+    # Dataset will try to read/write depth maps as .npy files on disk.
+    use_ply_depth_cache: bool = False
+    # Directory for PLY-based depth cache. If None and caching is enabled, defaults to
+    # <data_dir>/ply_depth_cache.
+    ply_depth_cache_dir: Optional[str] = None
+    # Whether to recompute all PLY-based depth maps at the start of training and overwrite
+    # any existing cache files. If False, training will prefer existing cache files and
+    # only compute missing ones on-the-fly.
+    ply_depth_recompute: bool = False
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -433,6 +446,9 @@ class Runner:
             external_depth_dir=cfg.external_depth_dir,
             external_depth_type=cfg.external_depth_type,
             external_depth_path=cfg.external_depth_path,
+            use_ply_depth_cache=cfg.use_ply_depth_cache,
+            ply_depth_cache_dir=cfg.ply_depth_cache_dir,
+            ply_depth_recompute=cfg.ply_depth_recompute,
         )
         self.valset = Dataset(
             self.parser,
@@ -1147,7 +1163,7 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
-
+        
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -1487,8 +1503,19 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             if pp_state is not None:
                 runner.post_processing_module.load_state_dict(pp_state)
         step = ckpts[0]["step"]
-        runner.eval(step=step)
-        runner.render_traj(step=step)
+        
+        # Run evaluation (metrics computation) only if run_eval is True
+        if cfg.run_eval:
+            runner.eval(step=step)
+        else:
+            print("[Eval-Only] Skipping metrics computation (run_eval: false)")
+        
+        # Render trajectory if render_traj_path is not "none"
+        if cfg.render_traj_path != "none":
+            runner.render_traj(step=step)
+        else:
+            print("[Eval-Only] Skipping trajectory rendering (render_traj_path: none)")
+        
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:

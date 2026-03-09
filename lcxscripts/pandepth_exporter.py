@@ -185,8 +185,12 @@ def render_cubemap_for_view(
     device: torch.device,
     sh_degree: int = 3,
     render_depth: bool = False,
+    depth_type: str = "expected",
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """Render 6 cubemap faces (RGB and optionally depth) around a given center camera pose.
+    
+    Args:
+        depth_type: "expected" for ED (Expected Depth) or "accumulated" for D (Accumulated Depth)
     
     Returns:
         face_images: Dict[str, np.ndarray] - RGB images for each face
@@ -199,7 +203,30 @@ def render_cubemap_for_view(
     K_face = make_cube_intrinsics(face_size).to(device)
     Ks = K_face.unsqueeze(0).repeat(len(face_names), 1, 1)  # [6, 3, 3]
 
-    render_mode = "RGB+ED" if render_depth else "RGB"
+    # Debug: Print Gaussian distribution info
+    if render_depth:
+        means = splats["means"]  # [N, 3]
+        cam_center_world = c2w_center[:3, 3]
+        # Compute distances from camera center to all Gaussians
+        gaussian_dists = torch.norm(means - torch.tensor(cam_center_world, device=device, dtype=means.dtype), dim=1)
+        gaussian_dists_np = gaussian_dists.detach().cpu().numpy()
+        print(f"    [Pre-render Debug] Gaussian distribution:")
+        print(f"      Total Gaussians: {len(means):,}")
+        print(f"      Distance from camera center: min={gaussian_dists_np.min():.3f}, max={gaussian_dists_np.max():.3f}, mean={gaussian_dists_np.mean():.3f}")
+        print(f"      Distance percentiles: 1%={np.percentile(gaussian_dists_np, 1):.3f}, 50%={np.percentile(gaussian_dists_np, 50):.3f}, 99%={np.percentile(gaussian_dists_np, 99):.3f}")
+        print(f"      Gaussians within near_plane: {np.sum(gaussian_dists_np < near_plane):,}")
+        print(f"      Gaussians beyond far_plane: {np.sum(gaussian_dists_np > far_plane):,}")
+        if far_plane < 1e9:
+            print(f"      Gaussians in valid range [{near_plane:.3f}, {far_plane:.3f}]: {np.sum((gaussian_dists_np >= near_plane) & (gaussian_dists_np <= far_plane)):,}")
+
+    # Choose render mode based on depth_type
+    if render_depth:
+        if depth_type == "accumulated":
+            render_mode = "RGB+D"  # Accumulated Depth (D)
+        else:
+            render_mode = "RGB+ED"  # Expected Depth (ED, default)
+    else:
+        render_mode = "RGB"
     colors, _, _ = rasterization(
         means=splats["means"],
         quats=splats["quats"],
@@ -223,7 +250,33 @@ def render_cubemap_for_view(
         render_mode=render_mode,
         sh_degree=sh_degree,  # Required when colors are SH coefficients
     )
-    colors = torch.clamp(colors, 0.0, 1.0)  # [6, H, W, 3] or [6, H, W, 4]
+    # Clamp RGB channels to [0,1] but preserve depth values (they are in world-space units)
+    if render_depth:
+        # Separate RGB and depth channels
+        rgb_channels = colors[..., :3]  # [6, H, W, 3]
+        depth_channel = colors[..., 3:4]  # [6, H, W, 1]
+        # Only clamp RGB channels
+        rgb_channels = torch.clamp(rgb_channels, 0.0, 1.0)
+        # Concatenate back: RGB + depth (depth is NOT clamped)
+        colors = torch.cat([rgb_channels, depth_channel], dim=-1)  # [6, H, W, 4]
+        
+        # Debug: Check depth values before any clamping
+        all_depths = depth_channel.detach().cpu().numpy().squeeze(-1)  # [6, H, W]
+        all_depths_valid = all_depths[all_depths > 0]
+        if len(all_depths_valid) > 0:
+            depth_min_all = all_depths_valid.min()
+            depth_max_all = all_depths_valid.max()
+            print(f"    [Post-render Debug] Depth value range across all faces (before clamping):")
+            print(f"      Global min: {depth_min_all:.6f}, max: {depth_max_all:.6f}")
+            if depth_max_all <= 1.0 and depth_min_all >= 0.0:
+                print(f"      [DIAGNOSIS] ⚠️  Depth values are in [0,1] range - may be normalized by rasterization!")
+                print(f"         This could explain why some faces show depth ≈ 1.0")
+                print(f"         Note: Depth values are now preserved (not clamped) for proper visualization")
+            elif depth_max_all > 1.0:
+                print(f"      Depth values exceed 1.0, using world-space units (preserved, not clamped)")
+    else:
+        # No depth channel, just clamp RGB
+        colors = torch.clamp(colors, 0.0, 1.0)  # [6, H, W, 3]
 
     face_images: Dict[str, np.ndarray] = {}
     face_depths: Dict[str, np.ndarray] = {}
@@ -235,6 +288,112 @@ def render_cubemap_for_view(
             depth = colors[i, ..., 3:4]  # [H, W, 1]
             img = (rgb.detach().cpu().numpy() * 255.0).astype(np.uint8)
             depth_np = depth.detach().cpu().numpy().squeeze(-1)  # [H, W]
+            
+            # Get camera pose for this face
+            c2w_face = c2w_faces_np[i]
+            cam_pos = c2w_face[:3, 3]
+            cam_forward = c2w_face[:3, 2]  # Forward direction in world space
+            
+            # Debug: Print raw depth statistics immediately after extraction
+            valid_mask = depth_np > 0
+            total_pixels = depth_np.size
+            valid_pixels = np.sum(valid_mask)
+            invalid_pixels = total_pixels - valid_pixels
+            
+            print(f"    [Render Debug] {name} - Raw depth from rasterization:")
+            print(f"      Shape: {depth_np.shape}, dtype: {depth_np.dtype}")
+            print(f"      Total pixels: {total_pixels}, Valid: {valid_pixels} ({100*valid_pixels/total_pixels:.1f}%), Invalid: {invalid_pixels} ({100*invalid_pixels/total_pixels:.1f}%)")
+            print(f"      Camera position: [{cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}]")
+            print(f"      Camera forward: [{cam_forward[0]:.3f}, {cam_forward[1]:.3f}, {cam_forward[2]:.3f}]")
+            print(f"      Render params: near={near_plane:.6f}, far={far_plane:.2e}")
+            
+            # Check RGB image statistics to see if there's geometry
+            rgb_mean = img.mean(axis=(0, 1))
+            rgb_std = img.std(axis=(0, 1))
+            rgb_nonzero = np.sum(np.any(img > 0, axis=2))
+            rgb_nonblack = np.sum(np.any(img > 10, axis=2))  # Pixels with some visible content
+            print(f"      RGB stats: mean=[{rgb_mean[0]:.1f}, {rgb_mean[1]:.1f}, {rgb_mean[2]:.1f}], std=[{rgb_std[0]:.1f}, {rgb_std[1]:.1f}, {rgb_std[2]:.1f}]")
+            print(f"      RGB non-zero pixels: {rgb_nonzero}/{total_pixels} ({100*rgb_nonzero/total_pixels:.1f}%)")
+            print(f"      RGB non-black pixels (>10): {rgb_nonblack}/{total_pixels} ({100*rgb_nonblack/total_pixels:.1f}%)")
+            
+            # Cross-check: Compare RGB content with depth validity
+            if valid_pixels > 0:
+                rgb_valid_mask = np.any(img > 10, axis=2)  # Pixels with visible RGB content
+                depth_valid_mask = valid_mask
+                both_valid = np.sum(rgb_valid_mask & depth_valid_mask)
+                rgb_only = np.sum(rgb_valid_mask & ~depth_valid_mask)
+                depth_only = np.sum(~rgb_valid_mask & depth_valid_mask)
+                neither = np.sum(~rgb_valid_mask & ~depth_valid_mask)
+                print(f"      Pixel correlation: RGB+Depth={both_valid}, RGB-only={rgb_only}, Depth-only={depth_only}, Neither={neither}")
+                if depth_only > total_pixels * 0.5:
+                    print(f"      [DIAGNOSIS] ⚠️  Many pixels have depth but no RGB content - possible background/empty space")
+                if rgb_only > total_pixels * 0.5:
+                    print(f"      [DIAGNOSIS] ⚠️  Many pixels have RGB but no depth - possible rendering issue")
+            
+            if valid_pixels > 0:
+                valid_depth = depth_np[valid_mask]
+                p1, p5, p10, p25, p50, p75, p90, p95, p99 = np.percentile(valid_depth, [1, 5, 10, 25, 50, 75, 90, 95, 99])
+                print(f"      Valid depth stats: min={valid_depth.min():.6f}, max={valid_depth.max():.6f}, mean={valid_depth.mean():.6f}, std={valid_depth.std():.6f}")
+                print(f"      Percentiles: 1%={p1:.6f}, 5%={p5:.6f}, 10%={p10:.6f}, 25%={p25:.6f}, 50%={p50:.6f}, 75%={p75:.6f}, 90%={p90:.6f}, 95%={p95:.6f}, 99%={p99:.6f}")
+                
+                # Check for specific suspicious patterns
+                depth_range = valid_depth.max() - valid_depth.min()
+                
+                # Check if all values are exactly the same (or very close)
+                unique_values = np.unique(valid_depth)
+                print(f"      Unique depth values: {len(unique_values)} (range: [{unique_values.min():.6f}, {unique_values.max():.6f}])")
+                
+                # Check if depth is close to 1.0 (possible normalization issue)
+                close_to_one = np.sum(np.abs(valid_depth - 1.0) < 1e-3)
+                if close_to_one > 0:
+                    print(f"      [DIAGNOSIS] {close_to_one}/{valid_pixels} ({100*close_to_one/valid_pixels:.1f}%) pixels have depth ≈ 1.0")
+                    if close_to_one == valid_pixels:
+                        print(f"      [DIAGNOSIS] ⚠️  ALL valid pixels have depth ≈ 1.0! Possible causes:")
+                        print(f"         - Depth values may be normalized to [0,1] range")
+                        print(f"         - All geometry is at far_plane distance")
+                        print(f"         - No geometry in this direction (empty space)")
+                
+                # Check if depth is close to far_plane
+                if far_plane < 1e9:  # Only check if far_plane is reasonable
+                    close_to_far = np.sum(np.abs(valid_depth - far_plane) < far_plane * 1e-3)
+                    if close_to_far > 0:
+                        print(f"      [DIAGNOSIS] {close_to_far}/{valid_pixels} ({100*close_to_far/valid_pixels:.1f}%) pixels have depth ≈ far_plane ({far_plane:.2e})")
+                        if close_to_far == valid_pixels:
+                            print(f"      [DIAGNOSIS] ⚠️  ALL valid pixels hit far_plane! Geometry may be too far or missing.")
+                
+                # Check if depth is close to near_plane
+                close_to_near = np.sum(np.abs(valid_depth - near_plane) < near_plane * 1e-2)
+                if close_to_near > 0:
+                    print(f"      [DIAGNOSIS] {close_to_near}/{valid_pixels} ({100*close_to_near/valid_pixels:.1f}%) pixels have depth ≈ near_plane ({near_plane:.6f})")
+                
+                # Check depth distribution
+                if depth_range > 0:
+                    # Check if depth is concentrated in a small range
+                    depth_span_90 = np.percentile(valid_depth, 95) - np.percentile(valid_depth, 5)
+                    depth_span_50 = np.percentile(valid_depth, 75) - np.percentile(valid_depth, 25)
+                    print(f"      Depth span: 90% range={depth_span_90:.6f}, 50% range (IQR)={depth_span_50:.6f}")
+                    if depth_span_90 / depth_range < 0.1:
+                        print(f"      [DIAGNOSIS] ⚠️  Depth values are highly concentrated (90% span is {100*depth_span_90/depth_range:.1f}% of total range)")
+                
+                # Check for suspicious values
+                if valid_depth.max() > 1e6:
+                    print(f"      [WARNING] Very large depth values detected (max={valid_depth.max():.2e})!")
+                if valid_depth.min() < 1e-6:
+                    print(f"      [WARNING] Very small depth values detected (min={valid_depth.min():.2e})!")
+                
+                if depth_range < 1e-3:
+                    print(f"      [WARNING] Depth range is very small ({depth_range:.6f})! Visualization may appear uniform.")
+                    print(f"      [DIAGNOSIS] Possible reasons:")
+                    print(f"         - All geometry is at the same distance from camera")
+                    print(f"         - Depth values are normalized/clamped")
+                    print(f"         - No geometry variation in this direction")
+            else:
+                print(f"      [WARNING] No valid depth values in {name}!")
+                print(f"      [DIAGNOSIS] All pixels have depth ≤ 0. Possible causes:")
+                print(f"         - No geometry visible in this direction")
+                print(f"         - All geometry is behind the camera")
+                print(f"         - Rendering issue")
+            
             face_images[name] = img
             face_depths[name] = depth_np
         else:
@@ -242,6 +401,16 @@ def render_cubemap_for_view(
             face_images[name] = img
     
     if render_depth:
+        # Print summary across all faces
+        print(f"    [Render Debug] Summary across all {len(face_depths)} faces:")
+        all_valid_depths = []
+        for name, depth_face in face_depths.items():
+            valid = depth_face[depth_face > 0]
+            if len(valid) > 0:
+                all_valid_depths.extend(valid.tolist())
+        if len(all_valid_depths) > 0:
+            all_valid_depths = np.array(all_valid_depths)
+            print(f"      Global depth stats (all faces combined): min={all_valid_depths.min():.6f}, max={all_valid_depths.max():.6f}, mean={all_valid_depths.mean():.6f}, std={all_valid_depths.std():.6f}")
         return face_images, face_depths
     else:
         return face_images, {}
@@ -272,6 +441,15 @@ def cubemap_to_equirect(
     pano_depth: Optional[np.ndarray] = None
     if cube_depths is not None:
         pano_depth = np.zeros((pano_h, pano_w), dtype=np.float32)
+        
+        # Debug: Print input cubemap depth statistics before conversion
+        print(f"    [Cubemap->Equirect Debug] Input cubemap depth statistics:")
+        for face_name, face_depth in cube_depths.items():
+            valid = face_depth[face_depth > 0]
+            if len(valid) > 0:
+                print(f"      {face_name}: min={valid.min():.6f}, max={valid.max():.6f}, mean={valid.mean():.6f}, valid_pixels={len(valid)}/{face_depth.size}")
+            else:
+                print(f"      {face_name}: No valid depth values")
 
     # Create grids of longitude (theta) and latitude (phi).
     # theta: [-pi, pi], phi: [-pi/2, pi/2]
@@ -401,11 +579,29 @@ def cubemap_to_equirect(
             if pano_depth is not None and ordered_depths is not None:
                 pano_depth[mask] = ordered_depths[fi][vv_i[mask], uu_i[mask]]
 
+    # Debug: Print output panorama depth statistics after conversion
+    if pano_depth is not None:
+        valid_mask = pano_depth > 0
+        total_pano_pixels = pano_depth.size
+        valid_pano_pixels = np.sum(valid_mask)
+        print(f"    [Cubemap->Equirect Debug] Output panorama depth statistics:")
+        print(f"      Shape: {pano_depth.shape}, dtype: {pano_depth.dtype}")
+        print(f"      Total pixels: {total_pano_pixels}, Valid: {valid_pano_pixels} ({100*valid_pano_pixels/total_pano_pixels:.1f}%)")
+        if valid_pano_pixels > 0:
+            valid_pano_depth = pano_depth[valid_mask]
+            p1, p5, p10, p25, p50, p75, p90, p95, p99 = np.percentile(valid_pano_depth, [1, 5, 10, 25, 50, 75, 90, 95, 99])
+            print(f"      Valid depth stats: min={valid_pano_depth.min():.6f}, max={valid_pano_depth.max():.6f}, mean={valid_pano_depth.mean():.6f}, std={valid_pano_depth.std():.6f}")
+            print(f"      Percentiles: 1%={p1:.6f}, 5%={p5:.6f}, 10%={p10:.6f}, 25%={p25:.6f}, 50%={p50:.6f}, 75%={p75:.6f}, 90%={p90:.6f}, 95%={p95:.6f}, 99%={p99:.6f}")
+        else:
+            print(f"      [WARNING] No valid depth values in output panorama!")
+
     return pano, pano_depth
 
 
 def visualize_depth_map_gsplat_style(
     depth: np.ndarray,
+    color_space: str = "linear",
+    debug_label: str = "",
 ) -> np.ndarray:
     """Convert depth map to grayscale visualization (gsplat video style).
     
@@ -415,6 +611,8 @@ def visualize_depth_map_gsplat_style(
     
     Args:
         depth: [H, W] float32 depth map
+        color_space: "linear" for linear depth, "log" for log depth visualization
+        debug_label: Optional label for debug output
     
     Returns:
         [H, W, 3] uint8 grayscale depth visualization
@@ -425,18 +623,46 @@ def visualize_depth_map_gsplat_style(
     if not np.any(valid_mask):
         # No valid depth, return black image
         h, w = depth.shape
+        if debug_label:
+            print(f"    [Visualize Debug] {debug_label} (gsplat_style): No valid depth values!")
         return np.zeros((h, w, 3), dtype=np.uint8)
     
+    # Debug: Print input depth statistics
+    valid_depth = depth[valid_mask]
+    if debug_label:
+        print(f"    [Visualize Debug] {debug_label} (gsplat_style) - Input depth:")
+        print(f"      Valid pixels: {np.sum(valid_mask)}/{depth.size} ({100*np.sum(valid_mask)/depth.size:.1f}%)")
+        print(f"      Raw depth: min={valid_depth.min():.6f}, max={valid_depth.max():.6f}, mean={valid_depth.mean():.6f}, std={valid_depth.std():.6f}")
+    
+    # Apply color space transformation
+    depth_vis = depth.copy()
+    if color_space == "log":
+        # Log depth space (similar to depth-anything-3 style)
+        depth_vis[valid_mask] = np.log(depth_vis[valid_mask])
+        if debug_label:
+            log_depth = depth_vis[valid_mask]
+            print(f"      After log transform: min={log_depth.min():.6f}, max={log_depth.max():.6f}, mean={log_depth.mean():.6f}")
+    
     # Normalize depth to [0, 1] using min/max (same as gsplat render_traj)
-    depth_min = depth[valid_mask].min()
-    depth_max = depth[valid_mask].max()
+    depth_min = depth_vis[valid_mask].min()
+    depth_max = depth_vis[valid_mask].max()
+    
+    if debug_label:
+        print(f"      Normalization range: [{depth_min:.6f}, {depth_max:.6f}], range={depth_max-depth_min:.6f}")
     
     if depth_max <= depth_min:
+        if debug_label:
+            print(f"      [WARNING] depth_max <= depth_min, adjusting...")
         depth_min = depth_min - 1e-6
         depth_max = depth_max + 1e-6
     
     # Normalize depth to [0, 1]
-    depth_norm = np.clip((depth - depth_min) / (depth_max - depth_min + 1e-10), 0.0, 1.0)
+    depth_norm = np.clip((depth_vis - depth_min) / (depth_max - depth_min + 1e-10), 0.0, 1.0)
+    
+    if debug_label:
+        norm_valid = depth_norm[valid_mask]
+        print(f"      Normalized depth: min={norm_valid.min():.6f}, max={norm_valid.max():.6f}, mean={norm_valid.mean():.6f}")
+        print(f"      Pixels at bounds: min_bound={np.sum(norm_valid <= 0.01)}, max_bound={np.sum(norm_valid >= 0.99)}")
     
     # Convert to grayscale (repeat 3 channels) and scale to [0, 255]
     depth_gray = (depth_norm * 255.0).astype(np.uint8)
@@ -445,6 +671,10 @@ def visualize_depth_map_gsplat_style(
     # Set invalid pixels to black
     depth_gray[~valid_mask] = 0
     
+    if debug_label:
+        gray_valid = depth_gray[valid_mask, 0]  # Use first channel
+        print(f"      Output grayscale: min={gray_valid.min()}, max={gray_valid.max()}, mean={gray_valid.mean():.1f}")
+    
     return depth_gray
 
 
@@ -452,12 +682,15 @@ def visualize_depth_map_colored(
     depth: np.ndarray,
     cmap: str = "Spectral",
     percentile: float = 2.0,
+    use_disparity: bool = True,  # Changed default to True (DA3 style)
+    color_space: str = "linear",
+    debug_label: str = "",
 ) -> np.ndarray:
     """Convert depth map to colored visualization (depth-anything-3 style).
     
     This matches the depth visualization used in depth-anything-3:
-    - Convert depth to disparity (1/depth)
-    - Use percentile-based min/max normalization
+    - Convert depth to disparity (1/depth) by default to handle uneven depth distribution
+    - Use percentile-based min/max normalization to avoid extreme values
     - Apply colormap (default: Spectral)
     - Invert so near objects are red, far objects are blue
     
@@ -465,6 +698,12 @@ def visualize_depth_map_colored(
         depth: [H, W] float32 depth map
         cmap: Matplotlib colormap name (default: "Spectral")
         percentile: Percentile for min/max computation (default: 2.0)
+        use_disparity: Whether to convert depth to disparity (1/depth) before visualization.
+                      If True, near objects will have higher values (better for observing close details).
+                      This is the default DA3 behavior and helps with uneven depth distribution.
+                      (default: True)
+        color_space: "linear" for linear depth, "log" for log depth visualization (default: "linear")
+        debug_label: Optional label for debug output
     
     Returns:
         [H, W, 3] uint8 colored depth visualization
@@ -475,28 +714,84 @@ def visualize_depth_map_colored(
     if not np.any(valid_mask):
         # No valid depth, return black image
         h, w = depth.shape
+        if debug_label:
+            print(f"    [Visualize Debug] {debug_label} (colored): No valid depth values!")
         return np.zeros((h, w, 3), dtype=np.uint8)
     
-    # Convert depth to disparity (1/depth)
-    depth[valid_mask] = 1.0 / depth[valid_mask]
+    # Debug: Print input depth statistics
+    valid_depth_orig = depth[valid_mask]
+    if debug_label:
+        print(f"    [Visualize Debug] {debug_label} (colored) - Input depth:")
+        print(f"      Valid pixels: {np.sum(valid_mask)}/{depth.size} ({100*np.sum(valid_mask)/depth.size:.1f}%)")
+        print(f"      Raw depth: min={valid_depth_orig.min():.6f}, max={valid_depth_orig.max():.6f}, mean={valid_depth_orig.mean():.6f}, std={valid_depth_orig.std():.6f}")
     
-    # Compute min/max using percentiles
-    if valid_mask.sum() <= 10:
-        depth_min = 0.0
-        depth_max = 0.0
+    # Convert depth to disparity (1/depth) - DA3 default behavior
+    # This helps with uneven depth distribution by making near objects have higher values
+    if use_disparity:
+        depth[valid_mask] = 1.0 / depth[valid_mask]
+        if debug_label:
+            disparity = depth[valid_mask]
+            print(f"      After disparity (1/depth): min={disparity.min():.6f}, max={disparity.max():.6f}, mean={disparity.mean():.6f}, std={disparity.std():.6f}")
+    
+    # Apply color space transformation
+    if color_space == "log":
+        # Log depth space (similar to depth-anything-3 tensor visualization)
+        depth[valid_mask] = np.log(depth[valid_mask])
+        if debug_label:
+            log_depth = depth[valid_mask]
+            print(f"      After log transform: min={log_depth.min():.6f}, max={log_depth.max():.6f}, mean={log_depth.mean():.6f}")
+    
+    # Compute min/max using percentiles (DA3 style: avoid extreme values)
+    valid_depth = depth[valid_mask]
+    if len(valid_depth) <= 10:
+        # Not enough valid points, use min/max
+        depth_min = valid_depth.min() if len(valid_depth) > 0 else 0.0
+        depth_max = valid_depth.max() if len(valid_depth) > 0 else 0.0
+        if debug_label:
+            print(f"      Using min/max (too few points): [{depth_min:.6f}, {depth_max:.6f}]")
     else:
-        depth_min = np.percentile(depth[valid_mask], percentile)
-        depth_max = np.percentile(depth[valid_mask], 100.0 - percentile)
+        # Use percentiles to avoid extreme values affecting visualization
+        depth_min = np.percentile(valid_depth, percentile)
+        depth_max = np.percentile(valid_depth, 100.0 - percentile)
+        if debug_label:
+            print(f"      Using {percentile}th percentile: min={depth_min:.6f}, max={depth_max:.6f}, range={depth_max-depth_min:.6f}")
+            print(f"      Full range: [{valid_depth.min():.6f}, {valid_depth.max():.6f}]")
     
-    if depth_min == depth_max:
-        depth_min = depth_min - 1e-6
-        depth_max = depth_max + 1e-6
+    # Ensure depth_min < depth_max
+    if depth_min >= depth_max:
+        if debug_label:
+            print(f"      [WARNING] depth_min >= depth_max, adjusting...")
+        if depth_min == depth_max:
+            # All values are the same, add small epsilon
+            depth_min = depth_min - 1e-6
+            depth_max = depth_max + 1e-6
+        else:
+            # Swap if min > max (shouldn't happen, but safety check)
+            depth_min, depth_max = depth_max, depth_min
     
-    # Normalize to [0, 1]
-    depth_norm = ((depth - depth_min) / (depth_max - depth_min + 1e-10)).clip(0, 1)
+    # Normalize to [0, 1] with clipping
+    depth_range = depth_max - depth_min
+    if depth_range < 1e-10:
+        # Range is too small, use uniform mapping
+        if debug_label:
+            print(f"      [WARNING] Depth range too small ({depth_range:.2e}), using uniform mapping")
+        depth_norm = np.ones_like(depth, dtype=np.float32) * 0.5
+        depth_norm[~valid_mask] = 0.0
+    else:
+        depth_norm = ((depth - depth_min) / depth_range).clip(0.0, 1.0)
+        depth_norm[~valid_mask] = 0.0
+        if debug_label:
+            norm_valid = depth_norm[valid_mask]
+            print(f"      Normalized depth: min={norm_valid.min():.6f}, max={norm_valid.max():.6f}, mean={norm_valid.mean():.6f}")
+            print(f"      Pixels at bounds: min_bound={np.sum(norm_valid <= 0.01)}, max_bound={np.sum(norm_valid >= 0.99)}")
     
     # Invert so near objects are red, far objects are blue (for Spectral colormap)
+    # When use_disparity=True, near objects have higher disparity values, so we invert
+    # to make near objects appear red (high colormap value) and far objects blue (low colormap value)
     depth_norm = 1.0 - depth_norm
+    if debug_label:
+        norm_valid_inv = depth_norm[valid_mask]
+        print(f"      After inversion: min={norm_valid_inv.min():.6f}, max={norm_valid_inv.max():.6f}, mean={norm_valid_inv.mean():.6f}")
     
     # Apply colormap
     cm = matplotlib.colormaps[cmap]
@@ -506,6 +801,10 @@ def visualize_depth_map_colored(
     # Set invalid pixels to black
     img_colored[~valid_mask] = 0
     
+    if debug_label:
+        colored_valid = img_colored[valid_mask]
+        print(f"      Output RGB: min=[{colored_valid.min(axis=0)}], max=[{colored_valid.max(axis=0)}], mean=[{colored_valid.mean(axis=0).astype(int)}]")
+    
     return img_colored
 
 
@@ -514,6 +813,9 @@ def visualize_depth_map(
     mode: str = "grayscale",
     cmap: str = "Spectral",
     percentile: float = 2.0,
+    use_disparity: bool = True,  # Changed default to True (DA3 style)
+    color_space: str = "linear",
+    debug_label: str = "",
 ) -> np.ndarray:
     """Convert depth map to visualization (grayscale or colored).
     
@@ -522,14 +824,18 @@ def visualize_depth_map(
         mode: "grayscale" or "colored" (default: "grayscale")
         cmap: Matplotlib colormap name (only used when mode="colored", default: "Spectral")
         percentile: Percentile for min/max computation (only used when mode="colored", default: 2.0)
+        use_disparity: Whether to convert depth to disparity (1/depth) before visualization
+                      (only used when mode="colored", default: True, DA3 style)
+        color_space: "linear" for linear depth, "log" for log depth visualization (default: "linear")
+        debug_label: Optional label for debug output
     
     Returns:
         [H, W, 3] uint8 depth visualization
     """
     if mode == "grayscale":
-        return visualize_depth_map_gsplat_style(depth)
+        return visualize_depth_map_gsplat_style(depth, color_space=color_space, debug_label=debug_label)
     elif mode == "colored":
-        return visualize_depth_map_colored(depth, cmap=cmap, percentile=percentile)
+        return visualize_depth_map_colored(depth, cmap=cmap, percentile=percentile, use_disparity=use_disparity, color_space=color_space, debug_label=debug_label)
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'grayscale' or 'colored'.")
 
@@ -541,6 +847,8 @@ def create_cubemap_grid(
     depth_mode: str = "grayscale",
     depth_cmap: str = "Spectral",
     depth_percentile: float = 2.0,
+    use_disparity: bool = True,  # Changed default to True (DA3 style)
+    color_space: str = "linear",
 ) -> np.ndarray:
     """Create a 2-row x 6-column grid image showing RGB and depth for each cubemap face.
     
@@ -553,6 +861,9 @@ def create_cubemap_grid(
         depth_mode: "grayscale" or "colored" (default: "grayscale")
         depth_cmap: Matplotlib colormap name (only used when depth_mode="colored", default: "Spectral")
         depth_percentile: Percentile for min/max computation (only used when depth_mode="colored", default: 2.0)
+        use_disparity: Whether to convert depth to disparity (1/depth) before visualization
+                      (only used when depth_mode="colored", default: True, DA3 style)
+        color_space: "linear" for linear depth, "log" for log depth visualization (default: "linear")
     
     Returns:
         [2*H, 6*W, 3] uint8 grid image
@@ -576,11 +887,59 @@ def create_cubemap_grid(
     # Second row: Depth images
     for col, face_name in enumerate(face_order):
         if face_name in cube_depths:
+            depth_face = cube_depths[face_name]
+            
+            # Debug: Print depth statistics (before transformation)
+            valid_depth = depth_face[depth_face > 0]
+            if len(valid_depth) > 0:
+                # 计算更多统计信息（原始深度值）
+                p1, p5, p10, p90, p95, p99 = np.percentile(valid_depth, [1, 5, 10, 90, 95, 99])
+                print(f"    [Depth Debug] {face_name} (raw depth): "
+                      f"min={valid_depth.min():.3f}, max={valid_depth.max():.3f}, "
+                      f"mean={valid_depth.mean():.3f}, std={valid_depth.std():.3f}")
+                print(f"    [Depth Debug] {face_name} percentiles: "
+                      f"1%={p1:.3f}, 5%={p5:.3f}, 10%={p10:.3f}, "
+                      f"90%={p90:.3f}, 95%={p95:.3f}, 99%={p99:.3f}")
+                
+                # 检查深度分布是否过于集中
+                depth_range = valid_depth.max() - valid_depth.min()
+                if depth_range < 0.1:
+                    print(f"    [WARNING] {face_name}: Depth range ({depth_range:.3f}) is very small! "
+                          f"Visualization may appear solid color.")
+                
+                # 如果使用 disparity，显示转换后的统计信息
+                if use_disparity and depth_mode == "colored":
+                    disparity = 1.0 / valid_depth
+                    disp_p1, disp_p5, disp_p10, disp_p90, disp_p95, disp_p99 = np.percentile(disparity, [1, 5, 10, 90, 95, 99])
+                    print(f"    [Depth Debug] {face_name} (disparity=1/depth): "
+                          f"min={disparity.min():.3f}, max={disparity.max():.3f}, "
+                          f"mean={disparity.mean():.3f}, std={disparity.std():.3f}")
+                    print(f"    [Depth Debug] {face_name} disparity percentiles: "
+                          f"1%={disp_p1:.3f}, 5%={disp_p5:.3f}, 10%={disp_p10:.3f}, "
+                          f"90%={disp_p90:.3f}, 95%={disp_p95:.3f}, 99%={disp_p99:.3f}")
+                    disp_range = disparity.max() - disparity.min()
+                    if disp_range < 0.1:
+                        print(f"    [WARNING] {face_name}: Disparity range ({disp_range:.3f}) is very small!")
+                
+                if color_space == "log":
+                    log_depth = np.log(valid_depth)
+                    log_range = log_depth.max() - log_depth.min()
+                    print(f"    [Depth Debug] {face_name} (log space): "
+                          f"min={log_depth.min():.3f}, max={log_depth.max():.3f}, "
+                          f"range={log_range:.3f}")
+                    if log_range < 0.1:
+                        print(f"    [WARNING] {face_name}: Log depth range ({log_range:.3f}) is very small!")
+            else:
+                print(f"    [Depth Debug] {face_name}: No valid depth values!")
+            
             depth_vis = visualize_depth_map(
-                cube_depths[face_name],
+                depth_face,
                 mode=depth_mode,
                 cmap=depth_cmap,
                 percentile=depth_percentile,
+                use_disparity=use_disparity,
+                color_space=color_space,
+                debug_label=f"cubemap_{face_name}",
             )
             grid[face_h:2*face_h, col*face_w:(col+1)*face_w, :] = depth_vis
     
@@ -593,6 +952,8 @@ def create_pano_combined(
     depth_mode: str = "grayscale",
     depth_cmap: str = "Spectral",
     depth_percentile: float = 2.0,
+    use_disparity: bool = True,  # Changed default to True (DA3 style)
+    color_space: str = "linear",
 ) -> np.ndarray:
     """Create a vertically stacked image with RGB panorama on top and depth panorama on bottom.
     
@@ -602,11 +963,22 @@ def create_pano_combined(
         depth_mode: "grayscale" or "colored" (default: "grayscale")
         depth_cmap: Matplotlib colormap name (only used when depth_mode="colored", default: "Spectral")
         depth_percentile: Percentile for min/max computation (only used when depth_mode="colored", default: 2.0)
+        use_disparity: Whether to convert depth to disparity (1/depth) before visualization
+                      (only used when depth_mode="colored", default: True, DA3 style)
+        color_space: "linear" for linear depth, "log" for log depth visualization (default: "linear")
     
     Returns:
         [2*H, W, 3] uint8 combined image
     """
     pano_h, pano_w = pano.shape[:2]
+    
+    # Debug: Print panorama depth statistics before visualization
+    valid_pano_mask = pano_depth > 0
+    if np.any(valid_pano_mask):
+        valid_pano_depth = pano_depth[valid_pano_mask]
+        print(f"    [Pano Combined Debug] Input panorama depth:")
+        print(f"      Valid pixels: {np.sum(valid_pano_mask)}/{pano_depth.size} ({100*np.sum(valid_pano_mask)/pano_depth.size:.1f}%)")
+        print(f"      Depth stats: min={valid_pano_depth.min():.6f}, max={valid_pano_depth.max():.6f}, mean={valid_pano_depth.mean():.6f}, std={valid_pano_depth.std():.6f}")
     
     # Convert depth to visualization
     depth_vis = visualize_depth_map(
@@ -614,6 +986,9 @@ def create_pano_combined(
         mode=depth_mode,
         cmap=depth_cmap,
         percentile=depth_percentile,
+        use_disparity=use_disparity,
+        color_space=color_space,
+        debug_label="pano_combined",
     )
     
     # Stack vertically: RGB on top, depth on bottom
@@ -696,12 +1071,24 @@ def main_entry() -> None:
         raise ValueError(f"Invalid depth_mode: {depth_mode}. Must be 'grayscale' or 'colored'.")
     depth_cmap = str(cfg.get("depth_cmap", "Spectral"))  # Matplotlib colormap name
     depth_percentile = float(cfg.get("depth_percentile", 2.0))  # Percentile for min/max computation
+    use_disparity = bool(cfg.get("use_disparity", True))  # Whether to use disparity (1/depth) for visualization (default: True, DA3 style)
+    
+    # Depth type and color space settings
+    depth_type = str(cfg.get("depth_type", "expected")).lower()  # "expected" (ED) or "accumulated" (D)
+    if depth_type not in ["expected", "accumulated"]:
+        raise ValueError(f"Invalid depth_type: {depth_type}. Must be 'expected' or 'accumulated'.")
+    depth_color_space = str(cfg.get("depth_color_space", "linear")).lower()  # "linear" or "log"
+    if depth_color_space not in ["linear", "log"]:
+        raise ValueError(f"Invalid depth_color_space: {depth_color_space}. Must be 'linear' or 'log'.")
 
     factor = int(cfg.get("data_factor", 1))
     normalize_world_space = bool(cfg.get("normalize_world_space", True))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[pandepth_exporter] Using device: {device}")
+    print(f"[pandepth_exporter] Depth type: {depth_type} ({'ED (Expected Depth)' if depth_type == 'expected' else 'D (Accumulated Depth)'})")
+    print(f"[pandepth_exporter] Depth color space: {depth_color_space}")
+    print(f"[pandepth_exporter] Depth visualization mode: {depth_mode}")
 
     # 1. Load splats from checkpoint.
     splats = load_splats_from_ckpt(ckpt_path, device=device)
@@ -816,6 +1203,7 @@ def main_entry() -> None:
 
         try:
             # Render RGB and depth cubemaps
+            print(f"  [Render] Rendering cubemap with depth_type={depth_type}, near={near_plane}, far={far_plane}")
             cube_faces, cube_depths = render_cubemap_for_view(
                 splats=splats,
                 c2w_center=c2w,
@@ -825,39 +1213,50 @@ def main_entry() -> None:
                 device=device,
                 sh_degree=sh_degree,
                 render_depth=True,
+                depth_type=depth_type,
             )
-            print(f"  ✓ Cubemap rendered: {len(cube_faces)} RGB faces, {len(cube_depths)} depth faces")
+            print(f"  ✓ Cubemap rendered: {len(cube_faces)} RGB faces, {len(cube_depths)} depth faces ({depth_type} depth)")
 
             # Convert to panorama (RGB and depth).
+            print(f"  [Convert] Converting cubemap to equirectangular panorama ({pano_h}x{pano_w})")
             pano, pano_depth = cubemap_to_equirect(
                 cube_faces, 
                 pano_h=pano_h, 
                 pano_w=pano_w,
                 cube_depths=cube_depths,
             )
+            print(f"  ✓ Panorama converted")
             
             # Create and save cubemap grid (2 rows x 6 columns: RGB and depth for each face)
             # Face order: front (posz), right (posx), back (negz), left (negx), top (posy), bottom (negy)
+            print(f"  [Visualize] Creating cubemap grid with depth_mode={depth_mode}, use_disparity={use_disparity}, color_space={depth_color_space}")
             cubemap_grid = create_cubemap_grid(
                 cube_faces, 
                 cube_depths,
                 depth_mode=depth_mode,
                 depth_cmap=depth_cmap,
                 depth_percentile=depth_percentile,
+                use_disparity=use_disparity,
+                color_space=depth_color_space,
             )
+            print(f"  ✓ Cubemap grid created")
             cubemap_grid_path = os.path.join(out_dir, f"{view_tag}_cubemap_grid.png")
             imageio.imwrite(cubemap_grid_path, cubemap_grid)
             print(f"  ✓ Cubemap grid saved: {cubemap_grid_path}")
             
             # Create and save combined panorama (RGB on top, depth on bottom)
             if pano_depth is not None:
+                print(f"  [Visualize] Creating combined panorama with depth_mode={depth_mode}, use_disparity={use_disparity}, color_space={depth_color_space}")
                 pano_combined = create_pano_combined(
                     pano, 
                     pano_depth,
                     depth_mode=depth_mode,
                     depth_cmap=depth_cmap,
                     depth_percentile=depth_percentile,
+                    use_disparity=use_disparity,
+                    color_space=depth_color_space,
                 )
+                print(f"  ✓ Combined panorama created")
                 pano_combined_path = os.path.join(out_dir, f"{view_tag}_pano_combined.png")
                 imageio.imwrite(pano_combined_path, pano_combined)
                 print(f"  ✓ Combined panorama saved: {pano_combined_path}")

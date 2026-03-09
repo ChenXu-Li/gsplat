@@ -3,19 +3,19 @@
 ## 本文件只用于离线导出，不参与训练。
 
 # 与训练/评估一致的数据目录（COLMAP 结构）
-data_dir: /root/autodl-tmp/data/colmap_360Roam_4x/bar16
+data_dir: /root/autodl-tmp/data/colmap_STAGE1_4x/BridgeB
 
 # 下采样因子，要与训练时保持一致（用于 Parser）
 data_factor: 1
 
 # 是否归一化世界坐标（要与训练 cfg.normalize_world_space 一致）
-normalize_world_space: true
+normalize_world_space: false
 
 # 输出根目录：每个视角会在下面创建子文件夹
-result_dir: /root/autodl-tmp/results/gsplat/bar16_denseinit_plydepth/pandepth
+result_dir: /root/autodl-tmp/results/gsplat/BridgeB_3dgs_DPAinit_depthloss/pandepth6999
 
 # 要加载的 ckpt（单个 rank 的 ckpt 即可）
-ckpt: /root/autodl-tmp/results/gsplat/bar16_denseinit_plydepth/ckpts/ckpt_5999_rank0.pt
+ckpt: /root/autodl-tmp/results/gsplat/BridgeB_3dgs_DPAinit_depthloss/ckpts/ckpt_6999_rank0.pt
 
 # 新方式：使用前向参考相机的外参作为全景图正前方
 # pano_cameras: 要导出的全景图编号列表（例如 [0, 1, 15] 表示导出 3 张全景图）
@@ -26,7 +26,7 @@ ckpt: /root/autodl-tmp/results/gsplat/bar16_denseinit_plydepth/ckpts/ckpt_5999_r
 #       -> pano_camera00 使用 pano_camera12 的第 0 张图片外参
 #       -> pano_camera01 使用 pano_camera12 的第 1 张图片外参
 #       -> pano_camera15 使用 pano_camera12 的第 15 张图片外参
-pano_cameras: [0, 1, 15]
+pano_cameras: [0,1,2,3]
 pano_front_camera_index: 12
 
 
@@ -38,7 +38,7 @@ pano_size: [1024, 2048]
 
 # 近远平面（和训练 cfg.near_plane / far_plane 对齐）
 near_plane: 0.01
-far_plane: 1.0e10
+far_plane: 1e10
 
 # 球谐函数度数（和训练 cfg.sh_degree 对齐，默认 3）
 sh_degree: 3
@@ -49,5 +49,20 @@ sh_degree: 3
 depth_mode: colored
 
 # 深度图彩色映射配置（仅在 depth_mode="colored" 时生效）
-depth_cmap: Spectral  # Matplotlib colormap 名称（如 "Spectral", "turbo", "viridis", "jet" 等）
-depth_percentile: 2.0  # 用于计算 min/max 的百分位数（默认 2.0，即使用 2% 和 98% 分位数）
+depth_cmap: turbo  # Matplotlib colormap 名称（如 "Spectral", "turbo", "viridis", "jet" 等）
+depth_percentile: 2  # 用于计算 min/max 的百分位数（默认 2.0，即使用 2% 和 98% 分位数）
+
+# 是否使用视差（disparity）进行深度可视化
+# true:  使用 1/depth（视差），近处变化更明显，适合观察近距离细节
+# false: 直接使用 depth，线性映射，适合观察整体深度分布（默认）
+use_disparity: false
+
+# 深度渲染类型
+# "expected": 使用期望深度 (ED, Expected Depth)，加权平均，数值更稳定，适合监督训练（默认）
+# "accumulated": 使用实际深度 (D, Accumulated Depth)，直接累加，可能更精确但边缘处不稳定
+depth_type: expected
+
+# 深度着色空间
+# "linear": 在线性深度空间下着色（默认）
+# "log": 在对数深度空间下着色（log(depth)），更适合观察大范围深度变化
+depth_color_space: log

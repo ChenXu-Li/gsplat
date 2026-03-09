@@ -1,8 +1,16 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import yaml
+
+# Ensure the examples directory is on sys.path (required for datasets.colmap import)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+_EXAMPLES_DIR = _REPO_ROOT / "examples"
+if str(_EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_DIR))
 
 from examples.simple_trainer import Config, main  # type: ignore
 from gsplat.distributed import cli  # type: ignore
@@ -95,6 +103,33 @@ def main_entry() -> None:
     # make sure we don't accidentally start a long-running interactive server.
     if not args.enable_viewer:
         cfg.disable_viewer = True
+
+    # Apply render trajectory settings from config
+    render_trajectory = raw_cfg.get("render_trajectory", True)
+    if not render_trajectory:
+        # Skip trajectory rendering by setting path to "none"
+        cfg.render_traj_path = "none"
+        print("[LCX Viewer] Trajectory rendering disabled (render_trajectory: false)")
+    else:
+        # Use configured trajectory path
+        cfg.render_traj_path = raw_cfg.get("render_traj_path", "interp")
+        print(f"[LCX Viewer] Trajectory mode: {cfg.render_traj_path}")
+
+    # Apply metrics computation setting (new run_eval config)
+    compute_metrics = raw_cfg.get("compute_metrics", True)
+    cfg.run_eval = compute_metrics
+    if not compute_metrics:
+        print("[LCX Viewer] Metrics computation disabled (compute_metrics: false)")
+    else:
+        print("[LCX Viewer] Metrics computation enabled (PSNR, SSIM, LPIPS)")
+
+    # Apply video generation setting
+    disable_video = raw_cfg.get("disable_video", False)
+    cfg.disable_video = disable_video
+    if disable_video:
+        print("[LCX Viewer] Video generation disabled (saving frames only)")
+    else:
+        print("[LCX Viewer] Video generation enabled (MP4)")
 
     # Ensure we run from the repo root so relative paths in examples work as expected
     repo_root = script_dir.parent

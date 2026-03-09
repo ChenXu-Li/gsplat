@@ -55,6 +55,12 @@ def load_config(config_path: Path) -> Tuple[object, str]:
     # Filter to known fields of the chosen Config to avoid unexpected-key errors.
     cfg_fields = {k for k in ConfigCls.__dataclass_fields__.keys()}  # type: ignore[attr-defined]
     filtered = {k: v for k, v in raw_cfg.items() if k in cfg_fields}
+    
+    # Ensure numeric fields are properly converted (YAML may parse 1e10 as string)
+    if "far_plane" in filtered:
+        filtered["far_plane"] = float(filtered["far_plane"])
+    if "near_plane" in filtered:
+        filtered["near_plane"] = float(filtered["near_plane"])
 
     return ConfigCls(**filtered), model_type  # type: ignore[call-arg]
 

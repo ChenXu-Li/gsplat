@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import imageio.v2 as imageio
@@ -446,6 +446,9 @@ class Dataset:
         external_depth_dir: Optional[str] = None,
         external_depth_type: str = "img",
         external_depth_path: Optional[str] = None,
+        use_ply_depth_cache: bool = False,
+        ply_depth_cache_dir: Optional[str] = None,
+        ply_depth_recompute: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -455,6 +458,9 @@ class Dataset:
         self.external_depth_dir = external_depth_dir
         self.external_depth_type = external_depth_type
         self.external_depth_path = external_depth_path
+        self.use_ply_depth_cache = use_ply_depth_cache
+        self.ply_depth_cache_dir = ply_depth_cache_dir
+        self.ply_depth_recompute = ply_depth_recompute
 
         if self.load_depths and self.use_external_depth:
             if self.external_depth_type == "img" and self.external_depth_dir is None:
@@ -505,6 +511,138 @@ class Dataset:
             if len(pcd.points) == 0:
                 raise ValueError(f"No points found in external depth PLY: {ply_path}")
             self._ply_points_world = np.asarray(pcd.points, dtype=np.float32)
+        
+        # On-disk cache for precomputed depth maps (only for PLY-based external depth).
+        # Files are stored as .npy, and their paths mirror parser.image_names:
+        #   images/pano_camera0/xxx.jpg -> <ply_depth_cache_dir>/pano_camera0/xxx.npy
+        if (
+            self.load_depths
+            and self.use_external_depth
+            and self.external_depth_type == "ply"
+            and self.use_ply_depth_cache
+        ):
+            # Default cache dir if not provided: <data_dir>/ply_depth_cache
+            if self.ply_depth_cache_dir is None:
+                self.ply_depth_cache_dir = os.path.join(self.parser.data_dir, "ply_depth_cache")
+            self.ply_depth_cache_dir = os.path.abspath(self.ply_depth_cache_dir)
+            os.makedirs(self.ply_depth_cache_dir, exist_ok=True)
+
+            # Optionally precompute / overwrite all cache files for the training split.
+            if self.split == "train" and self.ply_depth_recompute:
+                print(
+                    f"[Dataset] Recomputing PLY-based depth cache for "
+                    f"{len(self.indices)} training images into: {self.ply_depth_cache_dir}"
+                )
+                self._precompute_depth_maps()
+                print("[Dataset] PLY depth cache recompute completed.")
+
+    def _reproject_ply_to_depth_map(
+        self,
+        index: int,
+        image_shape: Tuple[int, int],
+        K: np.ndarray,
+        camtoworlds: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Reproject PLY point cloud to depth map for a given camera view.
+        
+        Args:
+            index: Image index in parser
+            image_shape: (H, W) of the image
+            K: Camera intrinsic matrix [3, 3]
+            camtoworlds: Camera-to-world transformation [4, 4]
+        
+        Returns:
+            depth_map: Depth map [H, W]
+        """
+        assert (
+            self._ply_points_world is not None
+        ), "PLY points not loaded for external depth."
+        
+        H, W = image_shape
+        worldtocams = np.linalg.inv(camtoworlds)  # [4, 4]
+        R = worldtocams[:3, :3]
+        t = worldtocams[:3, 3:4]
+        pts_world = self._ply_points_world  # [N, 3]
+        pts_cam = (R @ pts_world.T + t).T  # [N, 3]
+        z = pts_cam[:, 2]
+        # keep only points in front of the camera
+        front = z > 0
+        pts_cam = pts_cam[front]
+        z = z[front]
+        
+        if pts_cam.shape[0] > 0:
+            pts_proj = (K @ pts_cam.T).T  # [N, 3]
+            # Filter out points with zero or very small z (to avoid division by zero)
+            valid_z = np.abs(pts_proj[:, 2]) > 1e-6
+            pts_proj = pts_proj[valid_z]
+            z = z[valid_z]
+            if pts_proj.shape[0] > 0:
+                x = pts_proj[:, 0] / pts_proj[:, 2]
+                y = pts_proj[:, 1] / pts_proj[:, 2]
+                # Filter out invalid values (inf/nan) before casting
+                valid_xy = np.isfinite(x) & np.isfinite(y)
+                x = x[valid_xy]
+                y = y[valid_xy]
+                z = z[valid_xy]
+                if len(x) > 0:
+                    x_int = x.astype(np.int32)
+                    y_int = y.astype(np.int32)
+                    inside = (
+                        (x_int >= 0)
+                        & (x_int < W)
+                        & (y_int >= 0)
+                        & (y_int < H)
+                    )
+                    x_int = x_int[inside]
+                    y_int = y_int[inside]
+                    z_inside = z[inside]
+                    depth_map = np.zeros((H, W), dtype=np.float32)
+                    # For each pixel, keep the nearest depth.
+                    for xi, yi, zi in zip(x_int, y_int, z_inside):
+                        current = depth_map[yi, xi]
+                        if current == 0.0 or zi < current:
+                            depth_map[yi, xi] = zi
+                    return depth_map
+        
+        # No valid points; return all-zero depth map
+        return np.zeros((H, W), dtype=np.float32)
+    
+    def _precompute_depth_maps(self) -> None:
+        """Precompute and save depth maps for all images in this Dataset split."""
+        if self._ply_points_world is None or not self.use_ply_depth_cache:
+            return
+
+        assert self.ply_depth_cache_dir is not None
+
+        for item_idx, index in enumerate(tqdm(self.indices, desc="Precomputing depth maps")):
+            # Load image to get shape (after undistortion)
+            image = imageio.imread(self.parser.image_paths[index])[..., :3]
+            camera_id = self.parser.camera_ids[index]
+            K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
+            params = self.parser.params_dict[camera_id]
+            camtoworlds = self.parser.camtoworlds[index]
+
+            # Apply undistortion if needed
+            if len(params) > 0:
+                mapx, mapy = (
+                    self.parser.mapx_dict[camera_id],
+                    self.parser.mapy_dict[camera_id],
+                )
+                image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                image = image[y : y + h, x : x + w]
+
+            H, W = image.shape[:2]
+            depth_map = self._reproject_ply_to_depth_map(index, (H, W), K, camtoworlds)
+
+            # Build cache path mirroring image relative path
+            image_name = self.parser.image_names[index]
+            stem, _ = os.path.splitext(image_name)
+            rel_path = stem + ".npy"
+            cache_path = os.path.join(self.ply_depth_cache_dir, rel_path)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.save(cache_path, depth_map)
 
     def __len__(self):
         return len(self.indices)
@@ -597,46 +735,48 @@ class Dataset:
                     data["depth_map"] = torch.from_numpy(depth.astype(np.float32))
                 elif self.external_depth_type == "ply":
                     # Reproject fused PLY point cloud to obtain a dense-ish depth map.
-                    assert (
-                        self._ply_points_world is not None
-                    ), "PLY points not loaded for external depth."
-                    worldtocams = np.linalg.inv(camtoworlds)  # [4, 4]
-                    R = worldtocams[:3, :3]
-                    t = worldtocams[:3, 3:4]
-                    pts_world = self._ply_points_world  # [N, 3]
-                    pts_cam = (R @ pts_world.T + t).T  # [N, 3]
-                    z = pts_cam[:, 2]
-                    # keep only points in front of the camera
-                    front = z > 0
-                    pts_cam = pts_cam[front]
-                    z = z[front]
-                    if pts_cam.shape[0] > 0:
-                        pts_proj = (K @ pts_cam.T).T  # [N, 3]
-                        x = pts_proj[:, 0] / pts_proj[:, 2]
-                        y = pts_proj[:, 1] / pts_proj[:, 2]
-                        H, W = image.shape[:2]
-                        x_int = x.astype(np.int32)
-                        y_int = y.astype(np.int32)
-                        inside = (
-                            (x_int >= 0)
-                            & (x_int < W)
-                            & (y_int >= 0)
-                            & (y_int < H)
+                    # Prefer on-disk cache if enabled; otherwise compute on-the-fly.
+                    depth: Optional[np.ndarray] = None
+                    cache_path: Optional[str] = None
+
+                    if self.use_ply_depth_cache and self.ply_depth_cache_dir is not None:
+                        image_name = self.parser.image_names[index]
+                        stem, _ = os.path.splitext(image_name)
+                        rel_path = stem + ".npy"
+                        cache_path = os.path.join(self.ply_depth_cache_dir, rel_path)
+                        if os.path.isfile(cache_path):
+                            try:
+                                depth = np.load(cache_path)
+                            except Exception as e:
+                                print(f"[Dataset] Warning: failed to load cached depth '{cache_path}': {e}")
+                                depth = None
+
+                    if depth is None:
+                        # Compute on-the-fly (original behavior or when cache not available)
+                        assert (
+                            self._ply_points_world is not None
+                        ), "PLY points not loaded for external depth."
+                        depth = self._reproject_ply_to_depth_map(
+                            index, image.shape[:2], K, camtoworlds
                         )
-                        x_int = x_int[inside]
-                        y_int = y_int[inside]
-                        z_inside = z[inside]
-                        depth_map = np.zeros((H, W), dtype=np.float32)
-                        # For each pixel, keep the nearest depth.
-                        for xi, yi, zi in zip(x_int, y_int, z_inside):
-                            current = depth_map[yi, xi]
-                            if current == 0.0 or zi < current:
-                                depth_map[yi, xi] = zi
-                        data["depth_map"] = torch.from_numpy(depth_map)
-                    else:
-                        # No points in front of camera; provide an all-zero depth map.
-                        depth_map = np.zeros(image.shape[:2], dtype=np.float32)
-                        data["depth_map"] = torch.from_numpy(depth_map)
+                        # Save to cache if requested
+                        if self.use_ply_depth_cache and cache_path is not None:
+                            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                            try:
+                                np.save(cache_path, depth)
+                            except Exception as e:
+                                print(f"[Dataset] Warning: failed to save cached depth '{cache_path}': {e}")
+
+                    # Ensure depth map matches current image size; resize if needed.
+                    if depth.ndim == 3:
+                        depth = depth[..., 0]
+                    if depth.shape[:2] != image.shape[:2]:
+                        depth = cv2.resize(
+                            depth.astype(np.float32),
+                            (image.shape[1], image.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    data["depth_map"] = torch.from_numpy(depth.astype(np.float32))
                 else:
                     raise ValueError(
                         f"Unknown external_depth_type: {self.external_depth_type}"
